@@ -395,9 +395,14 @@ async def on_ready():
     # Sync slash commands
     try:
         synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} command(s)")
+        print(f"✅ Synced {len(synced)} slash command(s)")
+        if synced:
+            for cmd in synced:
+                print(f"   - /{cmd.name}")
     except Exception as e:
-        print(f"Failed to sync commands: {e}")
+        print(f"❌ Failed to sync commands: {e}")
+        import traceback
+        traceback.print_exc()
 
 @bot.event
 async def on_disconnect():
@@ -725,6 +730,30 @@ async def get_verify_channel(ctx):
     await ctx.send(embed=embed)
 
 # ======= SLASH COMMANDS =======
+@bot.command(name='sync')
+@commands.has_permissions(administrator=True)
+async def sync_commands(ctx):
+    """Manually sync slash commands (Admin only)"""
+    try:
+        synced = await bot.tree.sync()
+        embed = discord.Embed(
+            title="✅ Commands Synced",
+            description=f"Successfully synced {len(synced)} slash command(s)",
+            color=discord.Color.green()
+        )
+        if synced:
+            cmd_list = "\n".join([f"• `/{cmd.name}`" for cmd in synced])
+            embed.add_field(name="Synced Commands", value=cmd_list, inline=False)
+        embed.set_footer(text="Slash commands may take a few minutes to appear in Discord")
+        await ctx.send(embed=embed)
+    except Exception as e:
+        embed = discord.Embed(
+            title="❌ Sync Failed",
+            description=f"Failed to sync commands: {str(e)}",
+            color=discord.Color.red()
+        )
+        await ctx.send(embed=embed)
+
 @bot.tree.command(name="thank", description="Thank a customer and guide them to the vouch channel")
 @app_commands.describe(member="The customer to thank")
 async def thank_command(interaction: discord.Interaction, member: discord.Member):
