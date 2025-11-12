@@ -3,8 +3,10 @@ import json
 import discord
 import asyncio
 import time
+import io
 from discord.ext import commands, tasks
 from discord import ui
+from discord import app_commands
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -173,9 +175,6 @@ class VouchApprovalView(ui.View):
             # Award the point
             add_user_points(guild_id, user_id, 1)
             current_points = get_user_points(guild_id, user_id)
-            
-            # Update cooldown
-            user_last_vouch_time[user_id] = time.time()
             
             # Send approval message
             embed = discord.Embed(
@@ -392,6 +391,13 @@ async def on_ready():
     vouch_roles_data = load_vouch_roles()
     verification_channels = load_verification_channels()
     status_update.start()
+    
+    # Sync slash commands
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} command(s)")
+    except Exception as e:
+        print(f"Failed to sync commands: {e}")
 
 @bot.event
 async def on_disconnect():
@@ -419,27 +425,6 @@ async def on_message(message):
         # Check if the message is in the vouch channel (including emoji)
         if 'vouch' in message.channel.name.lower():
             print("\n=== Vouch Channel Message ===")
-            
-            # Check cooldown
-            current_time = time.time()
-            last_vouch_time = user_last_vouch_time.get(user_id, 0)
-            time_since_last_vouch = current_time - last_vouch_time
-            cooldown_seconds = COOLDOWN_MINUTES * 60
-            
-            if time_since_last_vouch < cooldown_seconds:
-                remaining_time = cooldown_seconds - time_since_last_vouch
-                remaining_minutes = int(remaining_time // 60)
-                remaining_seconds = int(remaining_time % 60)
-                
-                embed = discord.Embed(
-                    title="⏰ Cooldown Active",
-                    description=f"Please wait **{remaining_minutes}m {remaining_seconds}s** before vouching again!",
-                    color=discord.Color.orange()
-                )
-                embed.set_footer(text="This prevents spam and keeps the system fair 😊")
-                await message.channel.send(embed=embed, delete_after=10)
-                await bot.process_commands(message)
-                return
             
             # Check if the message has an image
             has_image = False
@@ -477,11 +462,21 @@ async def on_message(message):
                         await bot.process_commands(message)
                         return
                     
-                    # Get image URL
+                    # Get image URL and download image for attachment
                     image_url = None
+                    image_attachment = None
                     for attachment in message.attachments:
                         if any(attachment.filename.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']):
                             image_url = attachment.url
+                            # Download the image to send as attachment
+                            try:
+                                image_data = await attachment.read()
+                                image_attachment = discord.File(
+                                    io.BytesIO(image_data),
+                                    filename=attachment.filename
+                                )
+                            except Exception as e:
+                                print(f"Error downloading image: {e}")
                             break
                     
                     # Create unique vouch ID
@@ -511,9 +506,12 @@ async def on_message(message):
                     verify_embed.set_footer(text=f"Vouch ID: {vouch_id}")
                     verify_embed.timestamp = message.created_at
                     
-                    # Send to verification channel with approve/deny buttons
+                    # Send to verification channel with approve/deny buttons and image attachment
                     view = VouchApprovalView(vouch_id)
-                    await verification_channel.send(embed=verify_embed, view=view)
+                    if image_attachment:
+                        await verification_channel.send(embed=verify_embed, view=view, file=image_attachment)
+                    else:
+                        await verification_channel.send(embed=verify_embed, view=view)
                     
                     # Send confirmation to original channel
                     confirm_embed = discord.Embed(
@@ -723,6 +721,43 @@ async def get_verify_channel(ctx):
         )
     
     await ctx.send(embed=embed)
+
+# ======= SLASH COMMANDS =======
+@bot.tree.command(name="thank", description="Thank a customer and guide them to the vouch channel")
+@app_commands.describe(member="The customer to thank")
+async def thank_command(interaction: discord.Interaction, member: discord.Member):
+    """Thank a customer for choosing the server and guide them to vouch"""
+    
+    # Find vouch channel
+    vouch_channel = None
+    for channel in interaction.guild.text_channels:
+        if 'vouch' in channel.name.lower():
+            vouch_channel = channel
+            break
+    
+    embed = discord.Embed(
+        title="🙏 Thank You!",
+        description=f"Thank you **{member.mention}** for choosing **{interaction.guild.name}**!",
+        color=discord.Color.green()
+    )
+    
+    if vouch_channel:
+        embed.add_field(
+            name="📸 Leave a Vouch!",
+            value=f"After receiving your order, please head to {vouch_channel.mention} and post a vouch with an image!\n\n**How to vouch:**\n1. Go to {vouch_channel.mention}\n2. Post a message with an image of your order\n3. An admin will review and approve it\n4. Earn points for your vouch!",
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name="📸 Leave a Vouch!",
+            value="After receiving your order, please post a vouch in a channel with 'vouch' in the name!\n\n**How to vouch:**\n1. Find a channel with 'vouch' in the name\n2. Post a message with an image of your order\n3. An admin will review and approve it\n4. Earn points for your vouch!",
+            inline=False
+        )
+    
+    embed.set_footer(text="We appreciate your support! 💙")
+    embed.timestamp = interaction.created_at
+    
+    await interaction.response.send_message(embed=embed)
 
 # ======= POINTS COMMANDS =======
 @bot.command(name='points')
@@ -1053,7 +1088,7 @@ async def show_commands(ctx):
     # How Vouching Works
     embed.add_field(
         name="✅ How Vouching Works",
-        value="1. Post in a channel with 'vouch' in the name\n2. Include an image attachment\n3. Wait 5 minutes between vouches\n4. Vouch is sent for **admin approval**\n5. Earn 1 point when **approved**!",
+        value="1. Post in a channel with 'vouch' in the name\n2. Include an image attachment\n3. Vouch is sent for **admin approval**\n4. Earn 1 point when **approved**!",
         inline=False
     )
     
