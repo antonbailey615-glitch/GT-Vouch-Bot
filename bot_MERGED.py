@@ -19,6 +19,8 @@ bot = commands.Bot(command_prefix='!', intents=intents, reconnect=True)
 points_data = {}
 rewards_data = {}
 vouch_roles_data = {}
+verification_channels = {}  # guild_id: channel_id
+pending_vouches = {}  # vouch_id: {guild_id, user_id, message_id, channel_id, mentioned_role, image_url}
 # Cooldown tracking - user_id: timestamp
 user_last_vouch_time = {}
 COOLDOWN_MINUTES = 5
@@ -106,6 +108,144 @@ def reset_guild_vouch_roles(guild_id):
     guild_id = str(guild_id)
     vouch_roles_data[guild_id] = ["CHEF"]
     save_vouch_roles()
+
+def load_verification_channels():
+    """Load verification channel settings"""
+    try:
+        with open('verification_channels.json', 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+def save_verification_channels():
+    """Save verification channel settings"""
+    with open('verification_channels.json', 'w') as f:
+        json.dump(verification_channels, f, indent=4)
+
+def get_verification_channel(guild_id):
+    """Get verification channel ID for a guild"""
+    guild_id = str(guild_id)
+    return verification_channels.get(guild_id)
+
+def set_verification_channel(guild_id, channel_id):
+    """Set verification channel for a guild"""
+    guild_id = str(guild_id)
+    verification_channels[guild_id] = str(channel_id)
+    save_verification_channels()
+
+# Button view for vouch approval
+class VouchApprovalView(ui.View):
+    def __init__(self, vouch_id):
+        super().__init__(timeout=None)  # No timeout - buttons stay active
+        self.vouch_id = vouch_id
+    
+    @ui.button(label="✅ Approve", style=discord.ButtonStyle.green, emoji="✅")
+    async def approve_button(self, interaction: discord.Interaction, button: ui.Button):
+        await self.handle_approval(interaction, approved=True)
+    
+    @ui.button(label="❌ Deny", style=discord.ButtonStyle.red, emoji="❌")
+    async def deny_button(self, interaction: discord.Interaction, button: ui.Button):
+        await self.handle_approval(interaction, approved=False)
+    
+    async def handle_approval(self, interaction: discord.Interaction, approved: bool):
+        # Check if user has admin permissions
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "❌ You need administrator permissions to approve/deny vouches!",
+                ephemeral=True
+            )
+            return
+        
+        if self.vouch_id not in pending_vouches:
+            await interaction.response.send_message(
+                "❌ This vouch has already been processed or doesn't exist!",
+                ephemeral=True
+            )
+            return
+        
+        vouch_data = pending_vouches[self.vouch_id]
+        guild_id = vouch_data['guild_id']
+        user_id = vouch_data['user_id']
+        original_channel_id = vouch_data['channel_id']
+        original_message_id = vouch_data['message_id']
+        
+        if approved:
+            # Award the point
+            add_user_points(guild_id, user_id, 1)
+            current_points = get_user_points(guild_id, user_id)
+            
+            # Update cooldown
+            user_last_vouch_time[user_id] = time.time()
+            
+            # Send approval message
+            embed = discord.Embed(
+                title="✅ Vouch Approved!",
+                description=f"**{interaction.user.mention}** approved the vouch by <@{user_id}>",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="Points Awarded", value="1 point", inline=True)
+            embed.add_field(name="User's Total Points", value=f"{current_points} points", inline=True)
+            embed.set_footer(text=f"Approved by {interaction.user.display_name}")
+            
+            await interaction.response.edit_message(embed=embed, view=None)
+            
+            # Send confirmation to original channel
+            try:
+                original_channel = bot.get_channel(int(original_channel_id))
+                if original_channel:
+                    confirm_embed = discord.Embed(
+                        title="🎉 Vouch Approved! 🎉",
+                        description=f"Your vouch has been **approved**! You received **1 point**!",
+                        color=discord.Color.green()
+                    )
+                    confirm_embed.add_field(name="Current Points", value=f"**{current_points}** points", inline=False)
+                    confirm_embed.set_footer(text="Keep up the good work! 💪")
+                    
+                    try:
+                        original_message = await original_channel.fetch_message(int(original_message_id))
+                        await original_message.add_reaction('✅')
+                    except:
+                        pass
+                    
+                    await original_channel.send(embed=confirm_embed)
+            except Exception as e:
+                print(f"Error sending approval confirmation: {e}")
+        else:
+            # Deny the vouch
+            embed = discord.Embed(
+                title="❌ Vouch Denied",
+                description=f"**{interaction.user.mention}** denied the vouch by <@{user_id}>",
+                color=discord.Color.red()
+            )
+            embed.add_field(name="Reason", value="Vouch did not meet requirements", inline=False)
+            embed.set_footer(text=f"Denied by {interaction.user.display_name}")
+            
+            await interaction.response.edit_message(embed=embed, view=None)
+            
+            # Send denial message to original channel
+            try:
+                original_channel = bot.get_channel(int(original_channel_id))
+                if original_channel:
+                    deny_embed = discord.Embed(
+                        title="❌ Vouch Denied",
+                        description="Your vouch has been **denied**. No points were awarded.",
+                        color=discord.Color.red()
+                    )
+                    deny_embed.add_field(name="Reason", value="Vouch did not meet requirements", inline=False)
+                    deny_embed.set_footer(text="Please ensure your vouch includes an image and mentions a valid role.")
+                    
+                    try:
+                        original_message = await original_channel.fetch_message(int(original_message_id))
+                        await original_message.add_reaction('❌')
+                    except:
+                        pass
+                    
+                    await original_channel.send(embed=deny_embed)
+            except Exception as e:
+                print(f"Error sending denial confirmation: {e}")
+        
+        # Remove from pending vouches
+        del pending_vouches[self.vouch_id]
 
 # Button view for reward redemption
 class RewardView(ui.View):
@@ -246,10 +386,11 @@ async def on_ready():
     print(f'Bot is in {len(bot.guilds)} guilds')
     for guild in bot.guilds:
         print(f'- {guild.name} (id: {guild.id})')
-    global points_data, rewards_data, vouch_roles_data
+    global points_data, rewards_data, vouch_roles_data, verification_channels
     points_data = load_points()
     rewards_data = load_rewards()
     vouch_roles_data = load_vouch_roles()
+    verification_channels = load_verification_channels()
     status_update.start()
 
 @bot.event
@@ -311,80 +452,96 @@ async def on_message(message):
             
             print(f"\nImage check result: {has_image}")
             
-            # Get valid vouch roles for this specific guild
-            valid_roles = get_guild_vouch_roles(guild_id)
-            print(f"Valid vouch roles for {message.guild.name}: {valid_roles}")
-            
-            # Check if the message mentions someone with any valid vouch role
-            has_valid_role_mention = False
-            mentioned_role = None
-            
-            # Check role mentions
-            for role in message.role_mentions:
-                print(f"Checking role: {role.name}")
-                if role.name.lower() in [r.lower() for r in valid_roles]:
-                    has_valid_role_mention = True
-                    mentioned_role = role.name
-                    print(f"Found valid vouch role mention: {role.name}")
-                    break
-            
-            # Check for @role in message content
-            if not has_valid_role_mention:
-                for valid_role in valid_roles:
-                    if f'@{valid_role.lower()}' in message.content.lower():
-                        has_valid_role_mention = True
-                        mentioned_role = valid_role
-                        print(f"Found @{valid_role} in message content")
-                        break
-            
-            # Check if any mentioned user has a valid vouch role
-            if not has_valid_role_mention:
-                for member in message.mentions:
-                    print(f"Checking member roles for {member.name}: {[role.name for role in member.roles]}")
-                    for role in member.roles:
-                        if role.name.lower() in [r.lower() for r in valid_roles]:
-                            has_valid_role_mention = True
-                            mentioned_role = role.name
-                            print(f"Found valid vouch role on mentioned user: {member.name} ({role.name})")
-                            break
-                    if has_valid_role_mention:
-                        break
-            
-            print(f"\nValid role mention check result: {has_valid_role_mention}")
-            print(f"Mentioned role: {mentioned_role}")
-            
-            # If both conditions are met, add a point
-            if has_image and has_valid_role_mention:
-                print("\n=== Adding Point ===")
+            # If image is present, send to verification channel for approval
+            if has_image:
+                print("\n=== Vouch Detected - Sending for Approval ===")
                 
-                # Update cooldown
-                user_last_vouch_time[user_id] = current_time
+                # Get verification channel
+                verification_channel_id = get_verification_channel(guild_id)
                 
-                # Add point using guild-specific function
-                add_user_points(guild_id, user_id, 1)
-                current_points = get_user_points(guild_id, user_id)
-                
-                # Send a more visible confirmation message
-                embed = discord.Embed(
-                    title="🎉 Point Added! 🎉",
-                    description=f"**{message.author.mention}** received **1 point** for posting a vouch with an image and mentioning a {mentioned_role}!",
-                    color=discord.Color.green()
-                )
-                embed.add_field(name="Current Points", value=f"**{current_points}** points", inline=False)
-                embed.add_field(name="Server", value=f"{message.guild.name}", inline=False)
-                embed.set_footer(text="Keep up the good work! 💪")
+                if not verification_channel_id:
+                    # No verification channel set, send error message
+                    embed = discord.Embed(
+                        title="⚠️ Verification Channel Not Set",
+                        description="A verification channel needs to be set up for vouch approval. Please contact an administrator.",
+                        color=discord.Color.orange()
+                    )
+                    await message.channel.send(embed=embed, delete_after=10)
+                    await bot.process_commands(message)
+                    return
                 
                 try:
-                    # Send the embed and add a reaction to the original message
-                    await message.add_reaction('🎉')
-                    await message.channel.send(embed=embed)
-                    print(f"Successfully added point to {message.author.name} in {message.guild.name}. New total: {current_points}")
+                    verification_channel = bot.get_channel(int(verification_channel_id))
+                    if not verification_channel:
+                        print(f"Verification channel {verification_channel_id} not found!")
+                        await bot.process_commands(message)
+                        return
+                    
+                    # Get image URL
+                    image_url = None
+                    for attachment in message.attachments:
+                        if any(attachment.filename.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']):
+                            image_url = attachment.url
+                            break
+                    
+                    # Create unique vouch ID
+                    vouch_id = f"{guild_id}_{user_id}_{int(current_time)}"
+                    
+                    # Store pending vouch
+                    pending_vouches[vouch_id] = {
+                        'guild_id': guild_id,
+                        'user_id': user_id,
+                        'message_id': str(message.id),
+                        'channel_id': str(message.channel.id),
+                        'image_url': image_url,
+                        'timestamp': current_time
+                    }
+                    
+                    # Create embed for verification channel
+                    verify_embed = discord.Embed(
+                        title="🔍 Vouch Pending Approval",
+                        description=f"New vouch submitted by **{message.author.mention}** ({message.author.display_name})",
+                        color=discord.Color.blue()
+                    )
+                    verify_embed.add_field(name="User", value=f"<@{user_id}>", inline=True)
+                    verify_embed.add_field(name="Channel", value=f"<#{message.channel.id}>", inline=True)
+                    verify_embed.add_field(name="Original Message", value=f"[Jump to Message]({message.jump_url})", inline=False)
+                    if image_url:
+                        verify_embed.set_image(url=image_url)
+                    verify_embed.set_footer(text=f"Vouch ID: {vouch_id}")
+                    verify_embed.timestamp = message.created_at
+                    
+                    # Send to verification channel with approve/deny buttons
+                    view = VouchApprovalView(vouch_id)
+                    await verification_channel.send(embed=verify_embed, view=view)
+                    
+                    # Send confirmation to original channel
+                    confirm_embed = discord.Embed(
+                        title="⏳ Vouch Submitted for Review",
+                        description=f"Your vouch has been submitted for approval! An administrator will review it shortly.",
+                        color=discord.Color.blue()
+                    )
+                    confirm_embed.add_field(name="Status", value="Pending Approval", inline=False)
+                    confirm_embed.set_footer(text="You will be notified once your vouch is reviewed.")
+                    
+                    await message.channel.send(embed=confirm_embed, delete_after=15)
+                    await message.add_reaction('⏳')
+                    
+                    print(f"Vouch sent to verification channel for {message.author.name} in {message.guild.name}")
                 except Exception as e:
-                    print(f"Error sending confirmation: {str(e)}")
+                    print(f"Error sending vouch to verification channel: {str(e)}")
             else:
                 print("\n=== Conditions Not Met ===")
                 print(f"- Has image: {has_image}")
-                print(f"- Has valid role mention: {has_valid_role_mention}")
+                if not has_image:
+                    # Send helpful message if no image
+                    embed = discord.Embed(
+                        title="⚠️ Image Required",
+                        description="Please include an image attachment with your vouch!",
+                        color=discord.Color.orange()
+                    )
+                    embed.set_footer(text="Supported formats: PNG, JPG, JPEG, GIF, WEBP")
+                    await message.channel.send(embed=embed, delete_after=10)
         
         # Process commands
         await bot.process_commands(message)
@@ -503,6 +660,68 @@ async def list_vouch_roles(ctx):
     embed.add_field(name="Server", value=ctx.guild.name, inline=False)
     embed.add_field(name="Guild ID", value=guild_id, inline=False)
     embed.set_footer(text="Use !addvouchrole <role> to add a new role (Admin only)")
+    await ctx.send(embed=embed)
+
+@bot.command(name='setverifychannel')
+@commands.has_permissions(administrator=True)
+async def set_verify_channel(ctx, channel: discord.TextChannel = None):
+    """Set the verification channel for vouch approval (Admin only)"""
+    if channel is None:
+        channel = ctx.channel
+    
+    guild_id = str(ctx.guild.id)
+    set_verification_channel(guild_id, channel.id)
+    
+    embed = discord.Embed(
+        title="✅ Verification Channel Set",
+        description=f"Vouch verification channel has been set to {channel.mention}",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="Channel", value=f"{channel.mention} ({channel.name})", inline=False)
+    embed.add_field(name="Server", value=ctx.guild.name, inline=False)
+    embed.set_footer(text="All vouches will now be sent here for approval")
+    await ctx.send(embed=embed)
+
+@bot.command(name='getverifychannel')
+async def get_verify_channel(ctx):
+    """Get the current verification channel"""
+    guild_id = str(ctx.guild.id)
+    channel_id = get_verification_channel(guild_id)
+    
+    if not channel_id:
+        embed = discord.Embed(
+            title="⚠️ No Verification Channel Set",
+            description="No verification channel has been set for this server.",
+            color=discord.Color.orange()
+        )
+        embed.add_field(name="How to Set", value="Use `!setverifychannel #channel` (Admin only)", inline=False)
+        await ctx.send(embed=embed)
+        return
+    
+    try:
+        channel = bot.get_channel(int(channel_id))
+        if channel:
+            embed = discord.Embed(
+                title="📋 Verification Channel",
+                description=f"Current verification channel: {channel.mention}",
+                color=discord.Color.blue()
+            )
+            embed.add_field(name="Channel", value=f"{channel.mention} ({channel.name})", inline=False)
+            embed.add_field(name="Channel ID", value=str(channel_id), inline=False)
+        else:
+            embed = discord.Embed(
+                title="⚠️ Channel Not Found",
+                description=f"The verification channel (ID: {channel_id}) no longer exists.",
+                color=discord.Color.red()
+            )
+            embed.add_field(name="How to Fix", value="Use `!setverifychannel #channel` to set a new one (Admin only)", inline=False)
+    except:
+        embed = discord.Embed(
+            title="⚠️ Error",
+            description="Could not retrieve verification channel information.",
+            color=discord.Color.red()
+        )
+    
     await ctx.send(embed=embed)
 
 # ======= POINTS COMMANDS =======
@@ -817,6 +1036,13 @@ async def show_commands(ctx):
         inline=False
     )
     
+    # Verification Commands
+    embed.add_field(
+        name="🔍 Verification Commands",
+        value="`!setverifychannel [#channel]` - Set verification channel (Admin)\n`!getverifychannel` - Get current verification channel",
+        inline=False
+    )
+    
     # Rewards Commands
     embed.add_field(
         name="🏪 Rewards Commands",
@@ -827,7 +1053,7 @@ async def show_commands(ctx):
     # How Vouching Works
     embed.add_field(
         name="✅ How Vouching Works",
-        value="1. Post in a channel with 'vouch' in the name\n2. Include an image attachment\n3. Mention a valid vouch role\n4. Wait 5 minutes between vouches\n5. Earn 1 point automatically!",
+        value="1. Post in a channel with 'vouch' in the name\n2. Include an image attachment\n3. Wait 5 minutes between vouches\n4. Vouch is sent for **admin approval**\n5. Earn 1 point when **approved**!",
         inline=False
     )
     
