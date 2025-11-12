@@ -426,6 +426,8 @@ async def on_message(message):
         if 'vouch' in message.channel.name.lower():
             print("\n=== Vouch Channel Message ===")
             
+            current_time = time.time()
+            
             # Check if the message has an image
             has_image = False
             for attachment in message.attachments:
